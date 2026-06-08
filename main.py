@@ -3,15 +3,72 @@ from model import UserCreate,User,UserLogin,UserResponse,Image
 from fastapi import FastAPI,Depends,HTTPException,UploadFile,File
 from sqlmodel import Session,select
 from db import get_session
-from security import hash_password,verify_password,get_current_user,create_access_token
+from security import hash_password,verify_password,get_current_user,create_access_token,create_refresh_token,exchange_refresh_token
 from fastapi.security import OAuth2PasswordRequestForm
 import os
 from fastapi.responses import FileResponse
+import time 
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from exception import global_exception_handler
+from jose import jwt,JWTError
 
 app=FastAPI()
+app.add_exception_handler(
+    Exception,
+    global_exception_handler
+)
 @app.on_event("startup")
 def startup():
     create_tables()
+
+
+@app.middleware("http")
+async def logger(request:Request,call_next):
+
+    
+  
+    start=time.time()
+    response =await call_next(request)
+    end =time.time()
+    
+    
+    print(
+        f"{request.method}{request.url.path}\n"
+        f"took:{end-start}\n"
+    )
+    return response
+request_log={}
+@app.middleware("http")
+async def rate_limiter(
+    request: Request,call_next):
+
+
+    
+
+
+    client=request.client
+    ip=client.host if client else "unknown"
+    if ip not in request_log:
+        request_log[ip] =[]
+    now=time.time()
+    request_log[ip].append(now)
+    request_log[ip]=[t 
+              for t in request_log[ip]
+                         if now-t<60           ]
+    if len(request_log[ip])>=100:
+        return JSONResponse(
+    status_code=429,
+    content={
+        "detail": "Too many requests"
+    })
+    response=await call_next(request)
+    return response        
+
+        
+        
+
+
 
 @app.get("/")
 def home():
@@ -72,12 +129,14 @@ def login(
             status_code=401,
             detail="Invalid credentials"
         )
-    token = create_access_token(
+    access_token = create_access_token(
         {"sub": str(user.id)}
     )
+    refresh_token=create_refresh_token({"sub":str(user.id)})
 
     return {
-        "access_token": token,
+        "access_token": access_token,
+        "refresh_token":refresh_token,
         "token_type": "bearer"
     }
 
@@ -95,40 +154,45 @@ async def upload_image(file: UploadFile = File(...),
                        current_user: User = Depends(get_current_user),
                        session: Session = Depends(get_session)):
     filename = file.filename
+    allowed_extensions = [
+        ".png",
+        ".jpg",
+        ".jpeg"
+    ]
     if filename is None:
         raise HTTPException(
             status_code=400,
             detail="Filename is required"
         )
-    name,ext=os.path.splitext(filename)#splitfilename to name and extesion
-    if filename is None:
+    name, ext = os.path.splitext(filename)  # split filename to name and extension
+    if ext.lower() not in allowed_extensions:
         raise HTTPException(
             status_code=400,
-            detail="Filename is required"
+            detail="Unsupported file type"
         )
-    exisitng_file=session.exec(select(Image).where(Image.filename==filename)).first()
-    if exisitng_file:
-        filename=f'{name}({exisitng_file.id}){ext}'
+    existing_file = session.exec(
+        select(Image).where(Image.filename == filename)
+    ).first()
+    if existing_file:
+        filename = f'{name}({existing_file.id}){ext}'
 
-
-     
     contents = await file.read()  # ->actual image byte
-
 
     with open(
         f"uploads/{filename}",  # ->tell to open folder uploads filename and wb means in binary mode as f
         "wb"
     ) as f:
         f.write(contents)
-        image = Image(filename=filename,
-                      owner_id=current_user.id or 0
-                      )
-        
+        image = Image(
+            filename=filename,
+            owner_id=current_user.id or 0
+        )
+
         session.add(image)
         session.commit()
         session.refresh(image)
 
-        return{"message":"file uploaded"}
+        return {"message": "file uploaded"}
 
 # Create/Open file called filename
 #           ↓
@@ -140,11 +204,11 @@ async def upload_image(file: UploadFile = File(...),
 
 @app.get("/my-images")
 def get_my_images(
-    current_user:User=Depends(get_current_user),
-    session:Session=Depends(get_session)
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
 ):
-    statement =select(Image).where(Image.owner_id==User.id)
-    images=session.exec(statement).all()
+    statement = select(Image).where(Image.owner_id == current_user.id)
+    images = session.exec(statement).all()
 
     return  [
         {
@@ -176,3 +240,35 @@ def get_image(image_id:int,current_user:User=Depends(get_current_user),session:S
     return FileResponse(
         path=f"uploads/{image.filename}"
     )
+
+
+
+@app.delete("/images/{image_id}")
+def delete_image(image_id:int,current_user:User=Depends(get_current_user),session:Session=Depends(get_session)):
+    image=session.get(Image,image_id)
+    if not image:
+        raise HTTPException(
+            status_code=404,
+            detail="image doesnt exist"
+        )
+    if image.owner_id!=current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized"
+        )
+    filename=image.filename
+    session.delete(image)
+    session.commit()
+    os.remove(
+        f"uploads/{filename}"
+
+    )
+    return{"message":f"{filename} succesfully deleted"}
+    
+
+
+@app.post("/refresh")
+def refresh_token(refresh_token:str):
+    return  exchange_refresh_token(refresh_token)
+   
+   
